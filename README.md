@@ -28,3 +28,6 @@ Kubernetes Manifests: YAML files that define the desired state of our applicatio
 Deployments: Managing the application pods.
 Services: Exposing the application internally within the cluster.
 Ingress: Defining how external traffic, particularly HTTPS traffic, is routed to the application through the NGINX Ingress Controller.
+
+![image](https://github.com/user-attachments/assets/dac5c3a1-c243-411c-b4f5-d07b131dfe9c)
+
