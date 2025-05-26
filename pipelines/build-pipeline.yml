@@ -1,0 +1,266 @@
+trigger: none
+
+variables:
+
+- group: App_Deploy_Var
+
+
+pool:
+  name: AgentPool1
+
+stages:
+- stage: BuildAndPush
+  jobs:
+    - job: BuildAndPushImages
+      steps:
+      
+ 
+
+
+
+
+      - task: AzureCLI@2
+        displayName: 'Build and Push Docker Images'
+        inputs:
+          azureSubscription: $(azureSubscriptionEndpoint)  
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            echo "Enable Docker Buildx and set platform..."
+            docker buildx create --name buildx-builder --use || docker buildx use buildx-builder
+
+            echo "Login to ACR using Docker with service principal..."
+            docker login $(acrName).azurecr.io -u $(client_id) -p $(client_secret)
+
+            echo "Build and push coditas for linux/amd64..."
+            docker buildx build --platform linux/arm64 \
+              -t $(acrName).azurecr.io/coditas:$(imageTag) \
+              ./application/ \
+              --push
+
+
+
+
+- stage: Deploy
+  displayName: Deploy to dev
+  jobs:
+    - job: DeployToAKS
+      displayName: Deploy Microservices to AKS
+      steps:
+        - task: Kubernetes@1
+          displayName: 'Create/Apply Namespace'
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: $(azureSubscriptionEndpoint)
+            azureResourceGroup: $(resourceGroup)
+            kubernetesCluster: $(aksCluster)
+            command: apply
+            useConfigurationFile: true
+            configuration: $(manifestsPath)/namespace.yml
+
+        # --- 2. Get AKS Credentials ---
+        - task: AzureCLI@2
+          displayName: 'Get AKS Credentials'
+          inputs:
+            azureSubscription: $(azureSubscriptionEndpoint)
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az aks get-credentials --resource-group $(resourceGroup) --name $(aksCluster) --overwrite-existing
+              kubectl create secret docker-registry acr-auth \
+                --docker-server='$(docker-server)' \
+                --docker-username='$(docker-username)' \
+                --docker-password='$(docker-password)' \
+                -n $(namespace)
+
+        
+
+
+
+        - task: Bash@3
+          displayName: 'Install/Verify Cert-Manager'
+          timeoutInMinutes: 5 
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -e # Exit on error
+              CERT_MANAGER_VERSION="v1.14.5" # Use a recent, stable version
+              CERT_MANAGER_URL="https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER_VERSION/cert-manager.yaml"
+              
+              echo "Applying Cert-Manager manifest from $CERT_MANAGER_URL..."
+              # Apply the manifest - this includes CRDs and creates the cert-manager namespace
+              kubectl apply -f "$CERT_MANAGER_URL"
+
+              echo "Cert-Manager manifest applied. Waiting for pods to become ready..."
+              # Wait for the Cert-Manager pods (especially the webhook) to be ready
+              # This is important before applying issuers/certificates!
+              kubectl wait --for=condition=Ready pod --all -n cert-manager --timeout=300s
+              
+              echo "Cert-Manager pods are ready!"
+
+        # --- Your existing 'Apply Self-Signed ClusterIssuer' task goes AFTER this ---
+        - task: Kubernetes@1
+          displayName: 'Apply Self-Signed ClusterIssuer'
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: $(azureSubscriptionEndpoint)
+            azureResourceGroup: $(resourceGroup)
+            kubernetesCluster: $(aksCluster)
+            command: 'apply'
+            useConfigurationFile: true
+            configuration: '$(manifestsPath)/self-signed-issuer.yml'
+        # --- 4. Apply NGINX (Your Modified Local Version) ---
+        - task: Kubernetes@1
+          displayName: 'Apply MODIFIED NGINX Ingress Manifest'
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: $(azureSubscriptionEndpoint)
+            azureResourceGroup: $(resourceGroup)
+            kubernetesCluster: $(aksCluster)
+            command: 'apply'
+            useConfigurationFile: true
+            # Path to your NGINX file *already modified* for lower CPU
+            configuration: '$(manifestsPath)/nginx-deploy-modified.yml' 
+
+        # --- 5. Wait for NGINX External IP ---
+        - task: Bash@3
+          displayName: 'Wait for Ingress External IP & Set Variable'
+          name: GetNginxIp # Step name to reference its output variable
+          timeoutInMinutes: 5
+          inputs:
+            targetType: 'inline'
+            script: |
+              echo "Waiting for NGINX Ingress Controller External IP..."
+              count=0
+              max_count=30 # Wait for max 30 * 10s = 5 minutes
+              NGINX_NAMESPACE="ingress-nginx"
+
+              while [ $count -lt $max_count ]; do
+                IP=$(kubectl get svc ingress-nginx-controller -n $NGINX_NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' --ignore-not-found)
+                if [ -n "$IP" ] && [ "$IP" != "<none>" ]; then
+                  echo "Found NGINX External IP: $IP"
+                  echo "##vso[task.setvariable variable=nginxExternalIp]$IP"
+                  exit 0
+                fi
+                echo "NGINX External IP not found yet. Waiting 10 seconds... (Attempt $count/$max_count)"
+                sleep 10
+                count=$((count+1))
+              done
+              echo "##[error]Timed out waiting for NGINX External IP."
+              exit 1
+
+        # --- 5. Wait for NGINX External IP & Write to File ---
+        - task: Bash@3
+          displayName: 'Wait for IP & Write to File'
+          name: WriteNginxIpToFile # New name, though we won't use output var
+          timeoutInMinutes: 5
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -e # Exit on error
+              echo "Waiting for NGINX Ingress Controller External IP..."
+              count=0
+              max_count=30
+              NGINX_NAMESPACE="ingress-nginx"
+              IP_FILE="$(Pipeline.Workspace)/nginx_ip.txt" # Define file path
+
+              while [ $count -lt $max_count ]; do
+                IP=$(kubectl get svc ingress-nginx-controller -n $NGINX_NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' --ignore-not-found)
+                if [ -n "$IP" ] && [ "$IP" != "<none>" ]; then
+                  echo "Found NGINX External IP: $IP"
+                  # --- WRITE TO FILE INSTEAD OF VSO ---
+                  echo -n "$IP" > "$IP_FILE" 
+                  echo "IP address written to $IP_FILE"
+                  exit 0
+                fi
+                echo "NGINX External IP not found yet. Waiting 10 seconds..."
+                sleep 10
+                count=$((count+1))
+              done
+              echo "##[error]Timed out waiting for NGINX External IP."
+              exit 1
+
+        # --- 6. Read IP from File & Replace Tokens ---
+        - task: Bash@3
+          displayName: 'Read IP & Replace Tokens'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -e # Exit immediately if a command fails
+              echo "--- Starting Token Replacement (File Method) ---"
+              IP_FILE="$(Pipeline.Workspace)/nginx_ip.txt"
+              echo "Manifests Path is: $(manifestsPath)"
+              ls -lR $(manifestsPath)
+              
+              echo "Checking for IP file: $IP_FILE"
+              if [ ! -f "$IP_FILE" ]; then
+                echo "##[error]IP file [$IP_FILE] not found!"
+                exit 1
+              fi
+
+              # --- READ IP FROM FILE ---
+              THE_IP_ADDRESS=$(cat "$IP_FILE")
+              THE_IMAGE_TAG="$(Build.BuildId)"
+              THE_ACR_NAME="$(acrName)"
+
+              echo "IP Address read from file: $THE_IP_ADDRESS"
+
+              if [ -z "$THE_IP_ADDRESS" ]; then
+                echo "##[error]IP address read from file is EMPTY."
+                exit 1
+              fi
+
+              REPLACEMENT_HOST="hello-world.$THE_IP_ADDRESS.nip.io"
+              echo "Calculated replacement host: $REPLACEMENT_HOST"
+
+              # --- Perform Replacements ---
+              echo "Replacing __NIP_IO_HOST__..."
+              sed -i "s|__NIP_IO_HOST__|$REPLACEMENT_HOST|g" "$(manifestsPath)/ingress.yml"
+              
+              echo "Replacing \${IMAGE_TAG}..."
+              sed -i "s|\${IMAGE_TAG}|$THE_IMAGE_TAG|g" "$(manifestsPath)/deployment.yml"
+              echo "Replacing \${acrName}..."
+              sed -i "s|\${acrName}|$THE_ACR_NAME|g" "$(manifestsPath)/deployment.yml"
+
+              echo "--- Token Replacement Finished ---"
+              echo "--- Final Ingress Content: ---"
+              cat $(manifestsPath)/ingress.yml
+              echo "------------------------------"
+
+        - task: Kubernetes@1
+          displayName: 'Deploy App Deployment'
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: $(azureSubscriptionEndpoint)
+            azureResourceGroup: $(resourceGroup)
+            kubernetesCluster: $(aksCluster)
+            namespace: $(namespace) # Use your namespace variable
+            command: apply
+            useConfigurationFile: true
+            configuration: $(manifestsPath)/deployment.yml
+
+        # --- 8. Deploy App Service ---
+        - task: Kubernetes@1
+          displayName: 'Deploy App Service'
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: $(azureSubscriptionEndpoint)
+            azureResourceGroup: $(resourceGroup)
+            kubernetesCluster: $(aksCluster)
+            namespace: $(namespace) # Use your namespace variable
+            command: apply
+            useConfigurationFile: true
+            configuration: manifest/service.yaml # Using consistent path
+
+        # --- 9. Deploy App Ingress ---
+        - task: Kubernetes@1
+          displayName: 'Deploy App Ingress'
+          inputs:
+            connectionType: 'Azure Resource Manager'
+            azureSubscriptionEndpoint: $(azureSubscriptionEndpoint)
+            azureResourceGroup: $(resourceGroup)
+            kubernetesCluster: $(aksCluster)
+            namespace: $(namespace) # Use your namespace variable
+            command: apply
+            useConfigurationFile: true
+            configuration: $(manifestsPath)/ingress.yml
